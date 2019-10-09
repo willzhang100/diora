@@ -1,6 +1,7 @@
 import os
 import json
-
+import heapq
+from itertools import chain
 import nltk
 
 
@@ -42,15 +43,19 @@ class Tree(object):
     @classmethod
     def build_from_berkeley(cls, ex):
         result = cls()
-        result.tree = nltk_tree_to_tuples(nltk.Tree.fromstring(ex['tree'].strip()))
+        result.tree = nltk_tree_to_tuples(nltk.Tree.fromstring(ex['tree'].strip())) #19983
         result.spans = tuples_to_spans(result.tree)
         result.example_id = ex.get('example_id', ex.get('exampled_id', None))
-        assert result.example_id is not None, "Oops! No example id."
+        assert result.example_id is not None, "No example id for Berkeley parse."
         return result
 
     @classmethod
     def build_from_diora(cls, ex):
         result = cls()
+        result.tree = ex['tree']
+        result.spans = tuples_to_spans(result.tree)
+        result.example_id = ex['example_id']
+        assert result.example_id is not None, "No example id for Diora parse."
         return result
 
 
@@ -64,21 +69,114 @@ def read_supervised(path):
             except:
                 print('Skipping {}'.format(ex))
 
+def read_unsupervised(path):
+    with open(path) as f:
+        for line in f:
+            ex = json.loads(line)
+            try:
+                yield Tree.build_from_diora(ex)
+            except:
+                print('Skipping {}'.format(ex))
+
+def find_intersection(sup, unsup):
+    both = dict()
+    for id in unsup:
+        if id in sup.keys():
+            spans = dict()
+            spans['supervised'] = sup[id].spans
+            spans['unsupervised'] = unsup[id].spans
+            both[id] = spans
+    return both
+
+def calculate_statistics(intersect, n=10):
+    stats = dict()
+    stats['scores'] = dict()
+    hi = []
+    lo = []
+    avg_pre = 0
+    avg_rec = 0
+    counter = 0
+    for id in intersect:
+        stats['scores'][id] = dict()
+        truth = intersect[id]['supervised']
+        pred = intersect[id]['unsupervised']
+        
+        if len(truth) == 0 or len(pred) == 0:
+            continue
+        # calculate precision (how many predictions were relevant) 
+        common = set(truth).intersection(set(pred))
+        correct = [x for x in common]
+        print(correct, truth, pred)
+        correct_predictions = len(correct)
+        stats['scores'][id]['precision'] = correct_predictions / len(pred)
+        avg_pre += correct_predictions / len(pred)
+
+        # calculate recall (how many relevant items were selected)
+        stats['scores'][id]['recall'] = correct_predictions / len(truth)
+        avg_rec += correct_predictions / len(truth)
+
+        # calculate f1 score
+        pre = stats['scores'][id]['precision']
+        rec = stats['scores'][id]['recall']
+        f1 = float("-inf")
+        if pre + rec != 0:
+            f1 = 2 * (pre * rec) / (pre + rec)
+        stats['scores'][id]['f1'] = f1
+
+        # update hi
+        max_data = (f1, id)
+        min_data = (-f1, id)
+        heapq.heappush(hi, max_data)
+        if len(hi) > n:
+            heapq.heappop(hi)
+        
+        # update lo
+        heapq.heappush(lo, min_data)
+        if len(lo) > n:
+            heapq.heappop(lo)
+        
+        counter += 1
+
+    converted_lo = []
+    for i in range(len(lo)):
+        f1, id = lo[i]
+        converted_lo.append((-f1, id))
+
+    stats['highest'] = hi
+    stats['lowest'] = converted_lo
+    stats['average_precision'] = avg_pre / counter
+    stats['average_recall'] = avg_rec / counter
+
+    return stats
 
 def main(options):
-
     cache = {}
 
     # Read the supervised.
     cache['supervised'] = {}
     for x in read_supervised(options.supervised):
         cache['supervised'][x.example_id] = x
-
+    
     # Read the unsupervised.
-    # TODO: Will write it for binary trees from diora.
+    cache['unsupervised'] = {}
+    for x in read_unsupervised(options.unsupervised):
+        cache['unsupervised'][x.example_id] = x
 
-    # Measure the closeness of unsupervised to supervised.
-    # TODO: Compute the recall per sentence, and average.
+    print("supervised size:", len(cache['supervised']), "unsupervised size:", len(cache['unsupervised']))
+    
+    # Measure the closeness of unsupervised to supervised. 
+    
+    # find the keys that intersect, store in dict
+    intersect = find_intersection(cache['supervised'], cache['unsupervised'])
+    print(len(intersect))
+    
+    # Compute the recall per sentence, and average.
+    stats = calculate_statistics(intersect)
+
+    print(stats)
+    with open("nv_dev.stats", "a") as f:
+        f.write(json.dumps(stats))
+
 
 
 if __name__ == '__main__':
